@@ -6,12 +6,15 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 DB_PATH = DATA_DIR / "finance.db"
+
+
+VALID_STATUSES = {"planned", "done"}
 
 
 def get_db_connection() -> sqlite3.Connection:
@@ -31,10 +34,15 @@ def init_db() -> None:
             date TEXT NOT NULL,
             amount REAL NOT NULL,
             category TEXT NOT NULL,
-            description TEXT NOT NULL
+            description TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'done'
         )
         """
     )
+
+    columns = [row["name"] for row in cur.execute("PRAGMA table_info(transactions)").fetchall()]
+    if "status" not in columns:
+        cur.execute("ALTER TABLE transactions ADD COLUMN status TEXT NOT NULL DEFAULT 'done'")
 
     conn.commit()
     conn.close()
@@ -62,6 +70,15 @@ class TransactionBase(BaseModel):
     amount: float
     category: str
     description: str
+    status: str = "done"
+
+    @field_validator("status")
+    @classmethod
+    def validate_status(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in VALID_STATUSES:
+            raise ValueError("status must be 'planned' or 'done'")
+        return normalized
 
 
 class TransactionCreate(TransactionBase):
@@ -87,6 +104,7 @@ class TopDescriptionItem(BaseModel):
 def build_transaction_filters(
     month: Optional[str],
     category: Optional[str],
+    status: Optional[str],
 ) -> tuple[str, list[str]]:
     where_clauses: list[str] = []
     params: list[str] = []
@@ -99,6 +117,10 @@ def build_transaction_filters(
         where_clauses.append("LOWER(category) LIKE ?")
         params.append(f"%{category.lower()}%")
 
+    if status:
+        where_clauses.append("LOWER(status) = ?")
+        params.append(status.lower())
+
     where_sql = ""
     if where_clauses:
         where_sql = "WHERE " + " AND ".join(where_clauses)
@@ -110,13 +132,14 @@ def build_transaction_filters(
 def get_transactions(
     month: Optional[str] = Query(None),
     category: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
     db: sqlite3.Connection = Depends(get_db),
 ):
-    where_sql, params = build_transaction_filters(month, category)
+    where_sql, params = build_transaction_filters(month, category, status)
 
     rows = db.execute(
         f"""
-        SELECT id, date, amount, category, description
+        SELECT id, date, amount, category, description, status
         FROM transactions
         {where_sql}
         ORDER BY date DESC, id DESC
@@ -133,7 +156,18 @@ def get_summary(
     category: Optional[str] = Query(None),
     db: sqlite3.Connection = Depends(get_db),
 ):
-    where_sql, params = build_transaction_filters(month, category)
+    where_clauses = ["LOWER(status) = 'done'"]
+    params: list[str] = []
+
+    if month:
+        where_clauses.append("substr(date, 1, 7) = ?")
+        params.append(month)
+
+    if category:
+        where_clauses.append("LOWER(category) LIKE ?")
+        params.append(f"%{category.lower()}%")
+
+    where_sql = "WHERE " + " AND ".join(where_clauses)
 
     row = db.execute(
         f"""
@@ -162,14 +196,15 @@ def create_transaction(
     cur = db.cursor()
     cur.execute(
         """
-        INSERT INTO transactions (date, amount, category, description)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO transactions (date, amount, category, description, status)
+        VALUES (?, ?, ?, ?, ?)
         """,
         (
             transaction.date,
             transaction.amount,
             transaction.category,
             transaction.description,
+            transaction.status,
         ),
     )
     db.commit()
@@ -177,7 +212,7 @@ def create_transaction(
     new_id = cur.lastrowid
     row = db.execute(
         """
-        SELECT id, date, amount, category, description
+        SELECT id, date, amount, category, description, status
         FROM transactions
         WHERE id = ?
         """,
@@ -197,7 +232,7 @@ def update_transaction(
     cur.execute(
         """
         UPDATE transactions
-        SET date = ?, amount = ?, category = ?, description = ?
+        SET date = ?, amount = ?, category = ?, description = ?, status = ?
         WHERE id = ?
         """,
         (
@@ -205,6 +240,7 @@ def update_transaction(
             transaction.amount,
             transaction.category,
             transaction.description,
+            transaction.status,
             transaction_id,
         ),
     )
@@ -215,7 +251,7 @@ def update_transaction(
 
     row = db.execute(
         """
-        SELECT id, date, amount, category, description
+        SELECT id, date, amount, category, description, status
         FROM transactions
         WHERE id = ?
         """,
@@ -249,6 +285,7 @@ def get_top_descriptions(
     where_clauses = [
         "amount < 0",
         "LOWER(category) = 'alte cheltuieli'",
+        "LOWER(status) = 'done'",
     ]
     params: list[str] = []
 
